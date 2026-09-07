@@ -5,7 +5,7 @@ import logging
 import os
 from pathlib import Path
 from .browser import AcquireBrowser, AccessBlocked
-from .http import PoliteHttpClient
+from .http import HttpError, PoliteHttpClient
 from .models import SourceProduct
 from .state import State
 from .batch import BatchGenerator, BulkPublisher, Ledger, Paused
@@ -67,6 +67,37 @@ def parser():
     return p
 
 
+def _body_excerpt(body, limit=800):
+    if not body:
+        return ''
+    text = ' '.join(str(body).split())
+    return text if len(text) <= limit else text[:limit]+'…'
+
+
+def catalog_http_message(action, url, error):
+    status = error.status
+    if status == 404:
+        hint = ('Magic Catalog intentionally returns 404 when the admin token is missing/wrong. '
+            'Check MAGIC_CATALOG_URL and make MAGIC_CATALOG_IMPORT_TOKEN exactly match the deployed ADMIN_REINDEX_TOKEN; '
+            'redeploy Magic Catalog after changing that secret.')
+    elif status in (401,403):
+        hint = 'Authentication was rejected; verify the deployed ADMIN_REINDEX_TOKEN and MAGIC_CATALOG_IMPORT_TOKEN.'
+    elif status == 503:
+        hint = 'Scalable catalog resources are missing; in Magic Catalog run npm run scale:setup, then npm run deploy.'
+    elif status == 429:
+        hint = 'Catalog rate/write limit reached; the checkpoint is preserved and the same command is safe to rerun later.'
+    elif status == 400:
+        hint = 'Magic Catalog rejected the request; verify the deployed ingest schema matches this scraper.'
+    elif status is None:
+        hint = 'No HTTP response was received; check DNS/TLS/network connectivity and the configured catalog origin.'
+    else:
+        hint = 'The catalog request failed; checkpoints are preserved and rerunning is safe after the server issue is fixed.'
+    body = _body_excerpt(error.body)
+    details = f' Response: {body}' if body else ''
+    retry = f' Retry-After: {error.retry_after:g}s.' if error.retry_after is not None else ''
+    return f'Catalog {action} failed at {url}: HTTP {status if status is not None else "network error"}. {hint}{retry}{details}'
+
+
 def scrape_queue(state,args,browser):
     failures = 0
     for index,row in enumerate(state.rows(args.limit),1):
@@ -106,13 +137,24 @@ def generate_queue(state,args,ledger):
 def publish_queue(state,args,ledger):
     rows = [r for r in state.rows(args.limit) if r['product'] and not r['published_at']]
     if not rows:
+        LOG.info('Publish stage: no pending generated products in the selected limit.')
         return
     products = [json.loads(r['product']) for r in rows]
     ids = {p['slug']:r['id'] for r,p in zip(rows,products)}
-    publisher = BulkPublisher(client(1),ledger,os.getenv('MAGIC_CATALOG_URL','https://magic-catalog.cloudwebsites.workers.dev'),
-        os.getenv('MAGIC_CATALOG_IMPORT_TOKEN',''),args.daily_row_budget)
+    url = os.getenv('MAGIC_CATALOG_URL','https://magic-catalog.cloudwebsites.workers.dev')
+    publisher = BulkPublisher(client(1),ledger,url,os.getenv('MAGIC_CATALOG_IMPORT_TOKEN',''),args.daily_row_budget)
+    LOG.info('Publish stage: %d pending product(s); catalog=%s; requested batch=%d',len(products),publisher.url,args.publish_batch_size)
     from .state import now
-    publisher.publish(products,lambda p:state.update(ids[p['slug']],published_at=now(),error=None),args.publish_batch_size)
+    try:
+        publisher.publish(products,lambda p:state.update(ids[p['slug']],published_at=now(),error=None),args.publish_batch_size)
+    except HttpError as error:
+        # BulkPublisher handles POST failures itself. An HttpError escaping here is normally
+        # the authenticated preflight GET; keep the operation/context instead of mislabeling
+        # it as a browser failure.
+        raise ValueError(catalog_http_message('preflight/request',publisher.url+'/api/admin/catalog/ingest',error)) from None
+    except json.JSONDecodeError as error:
+        raise ValueError('Magic Catalog returned a non-JSON response during publish/preflight at '
+            +publisher.url+f': {error}. Check the deployment/proxy and rerun with --verbose.') from None
 
 
 def main(argv=None):
@@ -121,6 +163,7 @@ def main(argv=None):
         format='%(asctime)s %(levelname)s %(message)s')
     load_env()
     state = State(args.state_dir)
+    LOG.debug('Starting command=%s state_dir=%s verbose=%s',args.command,args.state_dir,args.verbose)
     try:
         if args.command == 'quota-status':
             ledger = Ledger()
@@ -183,7 +226,14 @@ def main(argv=None):
         LOG.error('%s',error)
         return 1
     except Exception as error:
-        LOG.error('%s: browser/runtime operation failed. Check installation and run login; checkpoints preserved.',type(error).__name__)
+        context = 'command='+args.command
+        if getattr(args,'command',None) == 'run':
+            context += ' stage='+getattr(args,'stage','unknown')
+        if args.verbose:
+            LOG.exception('Unexpected %s during %s: %s',type(error).__name__,context,error)
+        else:
+            LOG.error('Unexpected %s during %s: %s. Checkpoints preserved. Rerun the same command with --verbose for a traceback.',
+                type(error).__name__,context,error)
         return 1
     finally:
         state.db.close()
