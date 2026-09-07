@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "acquire-magic-import"
+version = "0.1.0"
+description = "Polite, resumable Acquire.com SaaS research to Magic Catalog"
+requires-python = ">=3.11"
+dependencies = ["playwright>=1.51,<2"]
+
+[project.scripts]
+acquire-magic-import = "acquire_scraper.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
