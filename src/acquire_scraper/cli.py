@@ -5,11 +5,10 @@ import logging
 import os
 from pathlib import Path
 from .browser import AcquireBrowser, AccessBlocked
-from .gemini import GeminiTransformer, TransformationError
 from .http import PoliteHttpClient
 from .models import SourceProduct
-from .publisher import Publisher, product_record
 from .state import State
+from .batch import BatchGenerator, BulkPublisher, Ledger, Paused
 
 MODELS = ('gemini-3.8-flash','gemini-3.7-flash','gemini-3.6-flash','gemini-3.5-flash','gemini-3-flash','gemini-2.5-flash')
 LOG = logging.getLogger(__name__)
@@ -45,11 +44,18 @@ def parser():
     sub = p.add_subparsers(dest='command',required=True)
     sub.add_parser('login',help='Sign in once in a local browser; securely reuse its profile')
     sub.add_parser('status')
+    sub.add_parser('quota-status')
     sub.add_parser('retry-failed',help='Clear errors while retaining all successful stages')
     export = sub.add_parser('export')
     export.add_argument('--output',type=Path)
     run = sub.add_parser('run')
     run.add_argument('--limit',type=positive,default=3,help='Total first N eligible listings in this checkpoint, including completed ones')
+    run.add_argument('--stage',choices=['all','scrape','generate','publish'],default='all')
+    run.add_argument('--batch-size',type=positive,default=25)
+    run.add_argument('--max-batch-size',type=positive,default=100)
+    run.add_argument('--publish-batch-size',type=positive,default=25)
+    run.add_argument('--daily-row-budget',type=positive,default=80000)
+    run.add_argument('--wait-minutes',type=float,default=2)
     run.add_argument('--scrape-only',action='store_true',help='Test scraping without Gemini or publishing')
     run.add_argument('--publish',action='store_true',help='Publish generated products to scalable ingest')
     run.add_argument('--offline',action='store_true',help='Process saved sources only; never open Acquire')
@@ -58,56 +64,55 @@ def parser():
     run.add_argument('--jitter',type=float,default=4)
     run.add_argument('--max-rounds',type=positive,default=5000)
     run.add_argument('--types',default='saas,ai,shopify app',help='Comma-separated card types; add mobile,crypto if wanted')
-    run.add_argument('--daily-publish-limit',type=positive,default=5000,help='Local per-UTC-day ingest attempts, including retries')
     return p
 
 
-def process(state,args,browser,transformer,publisher):
+def scrape_queue(state,args,browser):
     failures = 0
     for index,row in enumerate(state.rows(args.limit),1):
-        if row['error']:
-            failures += 1
+        if row['source'] or row['error'] or row['published_at']:
             continue
-        if row['published_at'] or (args.scrape_only and row['source']):
-            continue
-        LOG.info('[%d/%d] %s',index,args.limit,row['id'])
-        stage = 'scrape'
         try:
-            if not row['source']:
-                if browser is None:
-                    continue
-                source = browser.scrape(row)
-                state.update(row['id'],source=json.dumps(source.to_dict(),ensure_ascii=False))
-            else:
-                source = SourceProduct.from_dict(json.loads(row['source']))
-            if args.scrape_only:
-                continue
-            stage = 'generate'
-            if not row['product']:
-                result = transformer.transform(source,None,state.name_exists)
-                product = product_record(result.draft,source,row['created_at'])
-                state.update(row['id'],product=json.dumps(product,ensure_ascii=False,separators=(',',':')),model=result.generation_model)
-                state.export()
-            if publisher:
-                stage = 'publish'
-                refreshed = state.db.execute('SELECT * FROM items WHERE id=?',(row['id'],)).fetchone()
-                publisher.publish(refreshed)
+            LOG.info('[%d/%d] Scraping %s',index,args.limit,row['id'])
+            source = browser.scrape(row)
+            state.update(row['id'],source=json.dumps(source.to_dict(),ensure_ascii=False))
         except AccessBlocked:
             raise
-        except TransformationError:
-            # A quota outage should not poison thousands of pending items. Keep current
-            # row's scrape and stop; a normal rerun retries generation on this row.
-            LOG.error('All Gemini models failed. Source saved; resume after checking key/model access or quota.')
-            return 1
         except Exception as error:
-            if stage == 'publish':
-                # Leave generated row pending; a rerun retries exact slug and payload.
-                raise ValueError(str(error) if isinstance(error,ValueError) else 'Publish failed; generated payload preserved.') from None
-            state.fail(row,stage,error)
-            LOG.error('%s failed for %s (%s); use retry-failed after fixing it',stage,row['id'],type(error).__name__)
+            state.fail(row,'scrape',error)
             failures += 1
-    state.export()
-    return 1 if failures else 0
+    return failures
+
+
+def generate_queue(state,args,ledger):
+    jobs = [{'id':r['id'],'source':SourceProduct.from_dict(json.loads(r['source'])),'created_at':r['created_at']}
+        for r in state.rows(args.limit) if r['source'] and not r['product'] and not r['error'] and not r['published_at']]
+    if not jobs:
+        return
+    models = tuple(v.strip() for v in os.getenv('GEMINI_MODELS',','.join(MODELS)).split(',') if v.strip())
+    if not models:
+        raise ValueError('GEMINI_MODELS cannot be empty')
+    generator = BatchGenerator(client(1),os.getenv('GEMINI_API_KEY',''),models,ledger,args.batch_size,args.max_batch_size,args.wait_minutes)
+    def save(job,product,model):
+        # Preserve the same identity scheme as v0.1, including previous previews.
+        product.update(slug='acq-'+job['id'],id='acquire-'+job['id'],createdAt=job['created_at'])
+        state.update(job['id'],product=json.dumps(product,ensure_ascii=False,separators=(',',':')),model=model)
+    try:
+        generator.generate(jobs,save,state.name_exists)
+    finally:
+        state.export()
+
+
+def publish_queue(state,args,ledger):
+    rows = [r for r in state.rows(args.limit) if r['product'] and not r['published_at']]
+    if not rows:
+        return
+    products = [json.loads(r['product']) for r in rows]
+    ids = {p['slug']:r['id'] for r,p in zip(rows,products)}
+    publisher = BulkPublisher(client(1),ledger,os.getenv('MAGIC_CATALOG_URL','https://magic-catalog.cloudwebsites.workers.dev'),
+        os.getenv('MAGIC_CATALOG_IMPORT_TOKEN',''),args.daily_row_budget)
+    from .state import now
+    publisher.publish(products,lambda p:state.update(ids[p['slug']],published_at=now(),error=None),args.publish_batch_size)
 
 
 def main(argv=None):
@@ -117,6 +122,13 @@ def main(argv=None):
     load_env()
     state = State(args.state_dir)
     try:
+        if args.command == 'quota-status':
+            ledger = Ledger()
+            try:
+                print(json.dumps(ledger.summary(tuple(os.getenv('GEMINI_MODELS',','.join(MODELS)).split(','))),indent=2))
+            finally:
+                ledger.db.close()
+            return 0
         if args.command == 'status':
             print(json.dumps(state.summary(),indent=2))
             for row in state.db.execute('SELECT id,error FROM items WHERE error IS NOT NULL LIMIT 20'):
@@ -136,36 +148,38 @@ def main(argv=None):
             return 0
         if args.scrape_only and args.publish:
             raise ValueError('--scrape-only cannot be combined with --publish')
-        transformer = None
-        if not args.scrape_only:
-            models = tuple(v.strip() for v in os.getenv('GEMINI_MODELS',','.join(MODELS)).split(',') if v.strip())
-            if not models:
-                raise ValueError('GEMINI_MODELS is empty')
-            transformer = GeminiTransformer(client=client(),api_key=os.getenv('GEMINI_API_KEY',''),models=models)
-        publisher = None
-        if args.publish:
-            publisher = Publisher(client(1),state,
-                os.getenv('MAGIC_CATALOG_URL','https://magic-catalog.cloudwebsites.workers.dev'),
-                os.getenv('MAGIC_CATALOG_IMPORT_TOKEN',''),args.daily_publish_limit)
-        needs_browser = not args.offline and (state.summary()['discovered'] < args.limit or
-            any(not row['source'] and not row['error'] for row in state.rows(args.limit)))
+        if args.scrape_only:
+            args.stage = 'scrape'
+        failures = 0
+        needs_browser = args.stage in ('all','scrape') and not args.offline and (
+            state.count()<args.limit or any(not r['source'] and not r['error'] for r in state.rows(args.limit)))
         if needs_browser:
             with AcquireBrowser(args.state_dir,args.delay,args.jitter,args.headless) as browser:
                 browser.discover(state,args.limit,{v.strip().lower() for v in args.types.split(',')},args.max_rounds)
-                result = process(state,args,browser,transformer,publisher)
-        else:
-            result = process(state,args,None,transformer,publisher)
+                failures = scrape_queue(state,args,browser)
+        paused = False
+        ledger = Ledger()
+        try:
+            if args.stage in ('all','generate'):
+                try:
+                    generate_queue(state,args,ledger)
+                except Paused as error:
+                    LOG.warning('%s',error)
+                    paused = True
+            if args.stage == 'publish' or (args.stage=='all' and args.publish):
+                publish_queue(state,args,ledger)
+        finally:
+            ledger.db.close()
+            state.export()
         print(json.dumps(state.summary(),indent=2))
-        if args.offline and any(not row['source'] for row in state.rows(args.limit)):
-            LOG.warning('Some saved rows have not been scraped; run again without --offline.')
-            result = 1
         if not state.rows(args.limit):
-            raise ValueError('No saved listings to process.')
-        return result
+            raise ValueError('No saved listings to process. Run --stage scrape first.')
+        unfinished = any(not r['source'] for r in state.rows(args.limit))
+        return 1 if failures or paused or unfinished else 0
     except KeyboardInterrupt:
         print('\nStopped safely; rerun the same command to resume.')
         return 130
-    except (ValueError,AccessBlocked) as error:
+    except (ValueError,AccessBlocked,Paused) as error:
         LOG.error('%s',error)
         return 1
     except Exception as error:

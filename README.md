@@ -1,14 +1,8 @@
 # Acquire.com → Magic Catalog
 
-Direct, slow browser scraping of Acquire buyer-visible SaaS listings, Gemini-generated product pages, and restart-safe publishing to Magic Catalog's **new scalable architecture**:
+Slow direct browser scraping of buyer-visible SaaS descriptions, adaptive Gemini generation, and scalable catalog publishing. Anonymous listings work without unlocking a website or company name. No Acquire API is used. The scraper reads the product-description block, not data rooms, seller contacts, or private financial documents. It never contacts sellers or buys upgrades.
 
-- `/api/admin/catalog/ingest` authenticated with **ADMIN_REINDEX_TOKEN**
-- full product JSON in R2, compact metadata and FTS in the D1 search shards
-- **59 shared intent definitions**, not a new vector for each product
-
-No Acquire API credentials are needed. Company website/name unlocks are not needed: the visible product description is enough. The scraper reads the product-description block only; it does not open data rooms, contact sellers, buy an upgrade, or scrape private financial documents. It does not fetch external product websites.
-
-## Setup (Windows PowerShell)
+## First-time setup (Windows PowerShell)
 
 ```powershell
 git clone https://github.com/feet-code/acquire-scraper.git
@@ -18,134 +12,141 @@ py -m venv .venv
 python -m pip install -e .
 python -m playwright install chromium
 Copy-Item .env.example .env
-```
-
-On macOS/Linux use `python3 -m venv .venv`, `source .venv/bin/activate`, and `cp .env.example .env`; the remaining commands are the same. Python 3.11+ is required.
-
-### Sign in once
-
-```powershell
 acquire-magic-import login
 ```
 
-A normal Chromium window opens. Enter your buyer email and password **in that window**, then press Enter in the terminal. The command verifies access to the listings and saves the browser profile locally under `.state/browser-profile`. The profile includes session storage such as cookies and IndexedDB. No password is embedded in code or `.env`; do not commit or share the profile.
+Sign into Acquire in the opened browser, then press Enter in the terminal. The profile is saved under `.state/browser-profile`; no password is embedded in source or `.env`. Repeat login only when the buyer session expires. A ChatGPT cloud-browser login does not transfer to your PC.
 
-Login from a ChatGPT cloud browser does not transfer to the browser on your PC. Run this command once locally, and again only when your session expires.
+Python 3.11+ is required. On macOS/Linux use `python3 -m venv .venv`, `source .venv/bin/activate`, and `cp .env.example .env`.
 
-## Test three scrapes first (no Gemini key needed)
+Discovery incrementally scrolls All listings, saves each card, and deduplicates by both components of the listing URL. Defaults include SaaS, AI, and Shopify app cards. Use `--types saas` to narrow or `--types "saas,ai,shopify app,mobile,crypto"` to expand. Discovery reports actual coverage and stops after five paced checks without new cards or the `--max-rounds` ceiling; resuming rescans and deduplicates. Clear restrictive account filters during login for broader coverage.
 
-```powershell
-acquire-magic-import run --limit 3 --scrape-only
-acquire-magic-import status
-```
+Source actions normally wait 8–12 seconds; `--delay` has a minimum of five seconds. `--jitter` increases spacing and `--headless` reuses the saved local session without a visible window. Session expiry, challenges and rate limits stop safely; source Retry-After cooldowns are persisted. A missing product-description selector fails instead of generating from an upgrade prompt. No stealth or access-control bypasses are used.
 
-This saves three product descriptions in `.state/scraper.sqlite3`. Then put your Gemini key into `.env`:
-
-```text
-GEMINI_API_KEY=...
-```
-
-Generate three product pages without publishing:
+## Upgrade to batching
 
 ```powershell
-acquire-magic-import run --limit 3
+git pull
+python -m pip install -e .
 ```
 
-Review `.state/products.jsonl`. These records contain the full product-page fields Magic Catalog renders: name, audience, problem, promise, differentiator, workflow, keywords, and metrics. Original source text stays in the local checkpoint, not the public record.
+Keep your existing `.state` directory. Completed scrapes, generated records, and published products are retained. Existing Product Hunt drafts get a shared general-software intent when none was previously stored; they do not consume a Gemini call just to migrate. Already published legacy products remain published and are not copied into the new storage path.
 
-The Gemini model order matches Product Hunt:
-
-```text
-gemini-3.8-flash
-gemini-3.7-flash
-gemini-3.6-flash
-gemini-3.5-flash
-gemini-3-flash
-gemini-2.5-flash
-```
-
-These are attempted IDs, not a guarantee Google enables all of them for your key. Unavailable models, quota errors, malformed output, and validation failures fall through. If the entire chain fails, the run stops with the scraped input saved. Rerun after resolving the key/quota issue. There is no Cloudflare AI generation fallback.
-
-Generation writes fresh copy based on the described user problem and workflow, chooses a new name, and rejects copied seven-word phrases and duplicate generated names. The prompt excludes seller identities, URLs, source sale figures, and unsupported business claims. Names hidden by Acquire remain unknown; the scraper does not attempt to uncover them.
-
-## Publish the three test products
-
-Magic Catalog must have its scalable resources deployed. In **magic-catalog**, if you have not already completed scale setup:
+Before publishing, update **magic-catalog** too:
 
 ```powershell
-npm run scale:setup
-npx wrangler secret put ADMIN_REINDEX_TOKEN
+git pull
+npm ci
 npm run deploy
 ```
 
-Use the existing ADMIN_REINDEX_TOKEN if already configured; you do not need to replace it. In **acquire-scraper/.env**:
+If scalable resources have never been created, first run `npm run scale:setup` in magic-catalog. Its updated ingest endpoint reports measured D1 writes. The importers check that capability before sending products and stop if the old version is deployed. They use **ADMIN_REINDEX_TOKEN**, not the legacy ADMIN_IMPORT_TOKEN.
+
+## Three independent queues
+
+```powershell
+# Scrape only: no Gemini key or catalog token needed.
+acquire-magic-import run --stage scrape --limit 3
+
+# Generate from saved sources: no source-site requests.
+acquire-magic-import run --stage generate --limit 3
+
+# Publish saved products: no Gemini key or source-site requests.
+acquire-magic-import run --stage publish --limit 3
+```
+
+Review `.state/products.jsonl` after generation. These are compact public product records that Magic Catalog renders into pages, not HTML or copies of research pages.
+
+Scale up by raising the total selected limit:
+
+```powershell
+acquire-magic-import run --stage scrape --limit 100000
+acquire-magic-import run --stage generate --limit 100000
+acquire-magic-import run --stage publish --limit 100000
+```
+
+Or keep the one-command workflow:
+
+```powershell
+acquire-magic-import run --limit 100000 --publish
+```
+
+`run` first scrapes the selected inventory, then generates from the checkpoint, then optionally publishes. Gemini quota exhaustion pauses generation, but any valid generated products are still eligible for publishing. Use `--stage scrape` whenever you want to continue collecting source data independently. The default limit is still 3. A larger limit is a ceiling, not a guarantee the source contains that many distinct accessible products.
+
+`--scrape-only` is an alias for `--stage scrape`. `--offline` prevents source-site requests. Ctrl+C preserves completed stages; rerun the same command to resume. These are local CLI commands, not unattended scheduled jobs; daily quota resets do not restart a stopped process automatically.
+
+## Adaptive Gemini batches
+
+- Start with **25 products per ordinary generateContent request**.
+- Grow toward **50, then 100** after fully valid responses. Reduce the size after invalid/truncated output. The target size is saved across restarts and shared by both scrapers.
+- Size the request down further if its estimated input tokens would exceed the configured TPM allowance. Output is capped at 60,000 tokens with a per-product allowance; 100 is a ceiling, not a fixed count or a throughput promise.
+- Send short research signals and compact output fields; no HTML, articles, or images.
+- Match outputs to input IDs, reject unknown/duplicate IDs, source-brand leakage, copied phrases, and duplicate generated names.
+- Save each valid product independently. Recover complete items from a truncated JSON response and retry only unfinished items, at most three validation attempts per item per invocation.
+- The fallback chain remains `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3-flash`, `gemini-2.5-flash`.
+
+```powershell
+acquire-magic-import run --stage generate --limit 100000 --batch-size 25 --max-batch-size 100
+```
+
+This packs multiple products into normal API requests. It does **not** use Google's paid asynchronous Batch API or enable billing.
+
+## Shared, restart-safe quotas
+
+Both repositories default to **the same SQLite ledger** at `~/.magic-catalog/quotas.sqlite3` (your user home directory). Running them on the same computer and OS user shares Gemini request accounting, cooldowns, intent registration, and publishing budgets. Each scraper still has its own `.state` research checkpoint.
+
+Set these `.env` values to your actual AI Studio limits; defaults are conservative assumptions, not guaranteed Google quotas:
 
 ```text
-MAGIC_CATALOG_URL=https://magic-catalog.cloudwebsites.workers.dev
-MAGIC_CATALOG_IMPORT_TOKEN=the-same-value-as-ADMIN_REINDEX_TOKEN
+GEMINI_RPD=20
+GEMINI_RPM=5
+GEMINI_TPM=25000
+GEMINI_QUOTA_SCOPE=default-project
+MAGIC_WRITE_SCOPE=cloudflare-account
 ```
 
-This is **not** the old Product Hunt `ADMIN_IMPORT_TOKEN` endpoint/token.
+The limits above apply per configured model. The input-token estimate uses serialized request size; server 429s remain authoritative. The ledger reserves attempts **before** sending them, including failed requests. It saves model cooldowns, honors Retry-After, treats recognized daily-quota errors as unavailable until midnight Pacific, and skips missing models for 24 hours. Quota changes and cooldowns survive Ctrl+C and restarts.
+
+Temporary availability waits are bounded to two minutes by default, with short interruptible waits. Use `--wait-minutes 0` to stop immediately when no model is ready. Daily exhaustion prints the next eligible time and leaves unfinished items queued. Model/key errors do not poison every remaining source row.
 
 ```powershell
-acquire-magic-import run --limit 3 --publish
-```
-
-Product pages appear at `/product/<slug>` on your catalog. Slugs are stable `acq-<listing-hash>` identifiers. A retry—even after regeneration—upserts the same product instead of duplicating it or overwriting a different scraper's product.
-
-## Expand to everything accessible
-
-```powershell
-acquire-magic-import run --limit 10000 --publish
-```
-
-`--limit` is the **total first N eligible listings in this checkpoint**, including completed ones. Increasing from 3 to 10,000 processes the remaining items. Rerunning the same command skips completed stages. Raise the limit if more listings are available; 10,000 is a requested ceiling, not a claim about how many Acquire exposes.
-
-Discovery scans the all-listings page and scrolls incrementally as more cards load. It checkpoints every matching card, then processes the selected records. It includes `SaaS`, `AI`, and `Shopify app` cards by default; this avoids missing SaaS listed under AI. You can restrict to `--types saas`, or include `mobile,crypto` explicitly:
-
-```powershell
-acquire-magic-import run --limit 10000 --types "saas,ai,shopify app,mobile,crypto" --publish
-```
-
-Discovery ends when no new cards appear across five paced checks or `--max-rounds` is reached. It reports actual coverage, not a claim that all historical/sold/locked listings were found. If it stops short because of slow loading, rerun; it rescans from the top and deduplicates. Existing account filters can limit coverage; clear restrictive filters on the All listings page during login.
-
-## Pause, resume, and troubleshoot
-
-Ctrl+C is safe. Run the same command to resume; keep `.state` to preserve generated names, intent registration, and budget counters.
-
-```powershell
-# Counts plus the first 20 per-item errors
+acquire-magic-import quota-status
 acquire-magic-import status
-
-# Retry item-specific extraction failures, retaining successful work
 acquire-magic-import retry-failed
-acquire-magic-import run --limit 10000 --publish
-
-# Regenerate/export from saved sources without opening Acquire
-acquire-magic-import run --limit 10000 --offline
-acquire-magic-import export --output .state/review.jsonl
-
-# Slow the crawler further or run the saved browser session headlessly
-acquire-magic-import run --limit 10000 --delay 12 --jitter 5 --headless --publish
 ```
 
-- Source actions are sequential, normally spaced **8–12 seconds** apart; `--delay` cannot go below 5 seconds. The browser also loads the site's ordinary assets and background requests.
-- Source 429 responses stop the run; retry cooldowns are persisted. Sign-in expiry, challenges, and access denials stop without bypass attempts.
-- Gemini HTTP 429/temporary server responses honor Retry-After and bounded backoff.
-- Publishing uses one product per request, at least 8 seconds between requests, and a persistent default limit of **5,000 ingest attempts per UTC day**. Failed/partial writes consume the budget too. This is conservative headroom, not a global Cloudflare quota meter: other importers and site traffic share your quotas.
-- Each intent is supplied once per checkpoint. The catalog persists intents even if its vector write fails; repair vectors with `npm run vector:reindex` in Magic Catalog.
-- A publish error stops immediately and preserves the exact pending payload. Rerun to retry; no `retry-failed` command is needed for publish failures or a Gemini-wide outage.
-- HTTP 404 from ingest means wrong URL/token or undeployed endpoint. HTTP 503 usually means scale resources are not deployed. Runtime errors name the failed stage without dumping credentials or page HTML.
-- A changed Acquire layout fails visibly rather than generating pages from navigation or upgrade text. Selectors live in `src/acquire_scraper/extract.py`.
+If you customize `MAGIC_QUOTA_DB`, give both repositories the **same absolute file path**. `GEMINI_QUOTA_SCOPE` identifies the actual Google project; do not change it merely to reset quotas. Two different API keys for the same project still need the same scope. Other programs and separate computers do not automatically share this ledger; leave headroom for their usage. Run at most one process per scraper checkpoint.
 
-## Validation
+## Measured scalable publishing
+
+Set the following in each scraper's `.env`:
+
+```text
+GEMINI_API_KEY=your-key
+MAGIC_CATALOG_URL=https://magic-catalog.cloudwebsites.workers.dev
+MAGIC_CATALOG_IMPORT_TOKEN=the-same-value-as-the-Worker-ADMIN_REINDEX_TOKEN
+```
+
+Publishing uses `/api/admin/catalog/ingest`: R2 product bodies, sharded D1 metadata and FTS, and **59 shared intent vectors**. It never creates a vector per imported product. Source research and credentials are not sent in public product records.
+
+Generation batch size and import batch size are independent. The CLI permits an import ceiling of 25, but automatically honors the server's lower advertised limit, currently **7 products/request**. The current database statements plus intent and object writes need this smaller batch to leave room under the Worker Free request limits. Intent definitions are sent once per destination in the shared ledger.
+
+The default publishing allowance is **80,000 D1 rows/day shared between both importers**, leaving nominal headroom below D1 Free's 100,000. This counts measured metadata, index, FTS, and intent writes reported by D1; it does not assume one product equals one row.
+
+Before the first measured batch, reserve 100 rows per product. Afterwards estimate using the highest observed rows per product plus 50% and four extra rows. Successful batches reconcile reservations to actual reported usage. Failed/uncertain batches retain their conservative reservations; their exact saved products remain queued for idempotent retry. A missing acknowledgement or missing usage report never marks products as published. This is a local planning budget, not a guarantee against unobserved account traffic or an unexpectedly expensive query.
+
+```powershell
+acquire-magic-import run --stage publish --limit 100000 --daily-row-budget 60000
+```
+
+The budget resets at midnight UTC. Other applications on the account consume the same Cloudflare free allowance, so lower this budget if necessary. Renamed products use stable source-derived slugs; replaying a partially successful batch upserts the same products. Preserve both the research checkpoint and shared ledger for reliable progress/quota accounting.
+
+If vector indexing was unavailable, `npm run vector:reindex` in Magic Catalog repairs persisted intents. Neither scraper changes Cloudflare billing or provisions paid resources.
+
+## Tests
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
 
-Tests cover URL identity, anonymous listings, category filtering, copied-brand rejection, model fallback, intent validation, partial publish recovery, acknowledgement checking, daily budgets, checkpoint resumption, and credential-bearing redirect refusal.
-
-The implementation was checked against the live authenticated All listings page and anonymous SaaS description layout on September 7, 2026. Live Gemini generation and production ingestion additionally require your API key and catalog admin token.
-
-Gemini validation and the bounded HTTP client are adapted from your `feet-code/product-hunt-scraper` implementation; discovery, persistence, and scalable publishing are specific to this repository.
+Tests cover partial/truncated responses, wrong and duplicate IDs, adaptive sizing, model fallback, persisted daily/minute quotas, Pacific daylight-saving resets, intent reuse, server-advertised import caps, measured write accounting, partial failures, stable identities, and preservation of existing checkpoints.
