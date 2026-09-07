@@ -98,6 +98,30 @@ def catalog_http_message(action, url, error):
     return f'Catalog {action} failed at {url}: HTTP {status if status is not None else "network error"}. {hint}{retry}{details}'
 
 
+class CatalogPublishClient:
+    """Pass-through client that preserves detailed POST failures before BulkPublisher pauses."""
+    def __init__(self, inner):
+        self.inner = inner
+
+    @property
+    def max_attempts(self):
+        return self.inner.max_attempts
+
+    @max_attempts.setter
+    def max_attempts(self, value):
+        self.inner.max_attempts = value
+
+    def get(self, url, **kwargs):
+        return self.inner.get(url, **kwargs)
+
+    def post_json(self, url, payload, **kwargs):
+        try:
+            return self.inner.post_json(url, payload, **kwargs)
+        except HttpError as error:
+            LOG.error('%s', catalog_http_message('POST',url,error))
+            raise
+
+
 def scrape_queue(state,args,browser):
     failures = 0
     for index,row in enumerate(state.rows(args.limit),1):
@@ -142,7 +166,7 @@ def publish_queue(state,args,ledger):
     products = [json.loads(r['product']) for r in rows]
     ids = {p['slug']:r['id'] for r,p in zip(rows,products)}
     url = os.getenv('MAGIC_CATALOG_URL','https://magic-catalog.cloudwebsites.workers.dev')
-    publisher = BulkPublisher(client(1),ledger,url,os.getenv('MAGIC_CATALOG_IMPORT_TOKEN',''),args.daily_row_budget)
+    publisher = BulkPublisher(CatalogPublishClient(client(1)),ledger,url,os.getenv('MAGIC_CATALOG_IMPORT_TOKEN',''),args.daily_row_budget)
     LOG.info('Publish stage: %d pending product(s); catalog=%s; requested batch=%d',len(products),publisher.url,args.publish_batch_size)
     from .state import now
     try:
