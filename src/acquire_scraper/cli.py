@@ -218,11 +218,13 @@ def main(argv=None):
         if args.scrape_only:
             args.stage = 'scrape'
         failures = 0
+        discovery_incomplete = False
         needs_browser = args.stage in ('all','scrape') and not args.offline and (
             state.count()<args.limit or any(not r['source'] and not r['error'] for r in state.rows(args.limit)))
         if needs_browser:
             with AcquireBrowser(args.state_dir,args.delay,args.jitter,args.headless) as browser:
-                browser.discover(state,args.limit,{v.strip().lower() for v in args.types.split(',')},args.max_rounds)
+                discovery = browser.discover(state,args.limit,{v.strip().lower() for v in args.types.split(',')},args.max_rounds)
+                discovery_incomplete = isinstance(discovery,dict) and discovery.get('reason') != 'limit-reached'
                 failures = scrape_queue(state,args,browser)
         paused = False
         ledger = Ledger()
@@ -242,7 +244,7 @@ def main(argv=None):
         if not state.rows(args.limit):
             raise ValueError('No saved listings to process. Run --stage scrape first.')
         unfinished = any(not r['source'] for r in state.rows(args.limit))
-        return 1 if failures or paused or unfinished else 0
+        return 1 if failures or paused or unfinished or discovery_incomplete else 0
     except KeyboardInterrupt:
         print('\nStopped safely; rerun the same command to resume.')
         return 130

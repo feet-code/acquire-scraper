@@ -29,3 +29,15 @@ class StageTests(unittest.TestCase):
             with patch('acquire_scraper.cli.Ledger',return_value=Mock()),patch('acquire_scraper.cli.generate_queue') as generate,patch('acquire_scraper.cli.publish_queue') as publish,patch('acquire_scraper.cli.AcquireBrowser') as browser:
                 self.assertEqual(main(['--state-dir',directory,'run','--stage','publish','--limit','1']),0)
                 generate.assert_not_called();browser.assert_not_called();publish.assert_called_once()
+
+    def test_incomplete_discovery_still_scrapes_and_returns_nonzero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state=State(Path(directory))
+            state.add({'id':'one','url':'https://app.acquire.com/startup/a/b','title':'Example product','kind':'SaaS'})
+            state.update('one',source='{}')
+            state.db.close()
+            with patch('acquire_scraper.cli.Ledger',return_value=Mock()),patch('acquire_scraper.cli.AcquireBrowser') as factory,patch('acquire_scraper.cli.scrape_queue',return_value=0) as scrape:
+                factory.return_value.__enter__.return_value.discover.return_value={'reason':'no-more-progress','saved':1}
+                self.assertEqual(main(['--state-dir',directory,'run','--stage','scrape','--limit','10000']),1)
+                scrape.assert_called_once()
+            state=State(Path(directory));self.assertEqual(state.count(),1);state.db.close()

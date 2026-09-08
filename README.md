@@ -19,7 +19,21 @@ Sign into Acquire in the opened browser, then press Enter in the terminal. The p
 
 Python 3.11+ is required. On macOS/Linux use `python3 -m venv .venv`, `source .venv/bin/activate`, and `cp .env.example .env`.
 
-Discovery incrementally scrolls All listings, saves each card, and deduplicates by both components of the listing URL. Defaults include SaaS, AI, and Shopify app cards. Use `--types saas` to narrow or `--types "saas,ai,shopify app,mobile,crypto"` to expand. Discovery reports actual coverage and stops after five paced checks without new cards or the `--max-rounds` ceiling; resuming rescans and deduplicates. Clear restrictive account filters during login for broader coverage.
+Discovery follows Acquire's **See more** pagination control or its desktop `.load-more-block` scroll trigger, waiting for the rendered cards to change before advancing. It saves each card and deduplicates by both components of the listing URL. Defaults include SaaS, AI, and Shopify app cards. Use `--types saas` to narrow or `--types "saas,ai,shopify app,mobile,crypto"` to expand. Clear restrictive account filters in All listings for broader coverage.
+
+### If an older version stopped at 13
+
+The previous loader did not recognize **See more** and could scroll past the desktop loading trigger. Update and resume; keep `.state` and your saved login:
+
+```powershell
+git pull
+python -m pip install -e .
+acquire-magic-import run --stage scrape --limit 10000
+```
+
+`--limit 10000` is the total eligible-listing target, including saved listings. It does not cap discovery at the first results screen. Logs report rendered cards, eligible cards, unique URLs seen, saved count, and the pagination action. `.state/discovery.json` stores the latest coverage and stop reason without page content or credentials.
+
+Five unsuccessful page advances (each allowing up to 20 seconds for loading), or `--max-rounds`, stop discovery with an explicit incomplete-coverage warning and a nonzero exit code. Already discovered listings are still scraped and checkpointed. This avoids reporting a stalled page as a successful full crawl. Rerunning traverses the results again and deduplicates; it does not regenerate or republish completed products. A limit below your saved count needs no new discovery. Account filters, accessible inventory, and the selected card types determine coverage; the scraper cannot promise a particular inventory count or confirm exhaustion from an unchanged screen alone.
 
 Source actions normally wait 8–12 seconds; `--delay` has a minimum of five seconds. `--jitter` increases spacing and `--headless` reuses the saved local session without a visible window. Session expiry, challenges and rate limits stop safely; source Retry-After cooldowns are persisted. A missing product-description selector fails instead of generating from an upgrade prompt. No stealth or access-control bypasses are used.
 
