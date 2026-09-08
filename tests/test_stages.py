@@ -41,3 +41,13 @@ class StageTests(unittest.TestCase):
                 self.assertEqual(main(['--state-dir',directory,'run','--stage','scrape','--limit','10000']),1)
                 scrape.assert_called_once()
             state=State(Path(directory));self.assertEqual(state.count(),1);state.db.close()
+
+    def test_generate_publish_modes_skip_browser_and_publish_after_pause(self):
+        for flags in [['--stage','generate-publish'],['--stage','generate','--publish']]:
+            with self.subTest(flags=flags),tempfile.TemporaryDirectory() as directory:
+                state=State(Path(directory))
+                state.add({'id':'one','url':'https://app.acquire.com/startup/a/b','title':'Example product','kind':'SaaS'})
+                state.update('one',source='{}');state.db.close()
+                with patch('acquire_scraper.cli.Ledger',return_value=Mock()),patch('acquire_scraper.cli.generate_queue',side_effect=Paused('temporary unavailability')) as generate,patch('acquire_scraper.cli.publish_queue') as publish,patch('acquire_scraper.cli.AcquireBrowser') as browser:
+                    self.assertEqual(main(['--state-dir',directory,'run','--limit','100000',*flags]),1)
+                    generate.assert_called_once();publish.assert_called_once();browser.assert_not_called()

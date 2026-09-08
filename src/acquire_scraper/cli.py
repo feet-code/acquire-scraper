@@ -50,9 +50,9 @@ def parser():
     export.add_argument('--output',type=Path)
     run = sub.add_parser('run')
     run.add_argument('--limit',type=positive,default=3,help='Total first N eligible listings in this checkpoint, including completed ones')
-    run.add_argument('--stage',choices=['all','scrape','generate','publish'],default='all')
-    run.add_argument('--batch-size',type=positive,default=25)
-    run.add_argument('--max-batch-size',type=positive,default=100)
+    run.add_argument('--stage',choices=['all','scrape','generate','generate-publish','publish'],default='all')
+    run.add_argument('--batch-size',type=positive,default=50,help='Fixed products per Gemini call; final partial batch may be smaller')
+    run.add_argument('--max-batch-size',type=positive,default=100,help=argparse.SUPPRESS)
     run.add_argument('--publish-batch-size',type=positive,default=25)
     run.add_argument('--daily-row-budget',type=positive,default=80000)
     run.add_argument('--wait-minutes',type=float,default=2)
@@ -229,13 +229,13 @@ def main(argv=None):
         paused = False
         ledger = Ledger()
         try:
-            if args.stage in ('all','generate'):
+            if args.stage in ('all','generate','generate-publish'):
                 try:
                     generate_queue(state,args,ledger)
                 except Paused as error:
                     LOG.warning('%s',error)
                     paused = True
-            if args.stage == 'publish' or (args.stage=='all' and args.publish):
+            if args.stage in ('publish','generate-publish') or (args.stage in ('all','generate') and args.publish):
                 publish_queue(state,args,ledger)
         finally:
             ledger.db.close()
